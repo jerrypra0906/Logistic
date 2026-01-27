@@ -1,0 +1,1145 @@
+import { PoolClient } from 'pg';
+import logger from '../utils/logger';
+
+export interface DistributionResult {
+  contractId?: string;
+  shipmentId?: string;
+  qualitySurveyIds: string[];
+  truckingOperationIds: string[];
+  paymentId?: string;
+  surveyorIds: string[];
+}
+
+export class SapDataDistributionService {
+  
+  /**
+   * Resolve a contract id from available parsed data. Falls back to
+   * prior processed SAP data using STO number to find the contract number.
+   */
+  private static async resolveContractId(
+    client: PoolClient,
+    parsedData: any
+  ): Promise<string | undefined> {
+    // Try direct upsert path keys
+    const contractNumber: string | undefined = parsedData?.contract?.contract_no || undefined;
+    const poNumber: string | undefined = parsedData?.contract?.po_no || undefined;
+    if (contractNumber || poNumber) {
+      const existing = await client.query(
+        `SELECT id FROM contracts WHERE contract_id = $1 OR po_number = $2 LIMIT 1`,
+        [contractNumber || null, poNumber || null]
+      );
+      if (existing.rows.length > 0) {
+        return existing.rows[0].id as string;
+      }
+    }
+
+    // Fallback: use STO number to find prior processed data => contract_number => contract id
+    const stoNumber: string | undefined = parsedData?.shipment?.sto_no || parsedData?.contract?.sto_no || undefined;
+    if (stoNumber) {
+      const prior = await client.query(
+        `SELECT contract_number FROM sap_processed_data 
+         WHERE sto_number = $1 AND contract_number IS NOT NULL 
+         ORDER BY created_at DESC NULLS LAST LIMIT 1`,
+        [stoNumber]
+      );
+      const priorContractNumber: string | undefined = prior.rows[0]?.contract_number;
+      if (priorContractNumber) {
+        const existingByPrior = await client.query(
+          `SELECT id FROM contracts WHERE contract_id = $1 LIMIT 1`,
+          [priorContractNumber]
+        );
+        if (existingByPrior.rows.length > 0) {
+          return existingByPrior.rows[0].id as string;
+        }
+      }
+    }
+
+    return undefined;
+  }
+
+  /**
+   * Distribute parsed SAP data to main tables
+   */
+  static async distributeData(
+    client: PoolClient,
+    parsedData: any,
+    userId?: string
+  ): Promise<DistributionResult> {
+    const result: DistributionResult = {
+      qualitySurveyIds: [],
+      truckingOperationIds: [],
+      surveyorIds: []
+    };
+    
+    try {
+      // 1. Create or update contract
+      if (this.hasContractData(parsedData.contract, parsedData)) {
+        try {
+          logger.info('Attempting to upsert contract with data:', {
+            contract_no: parsedData.contract?.contract_no,
+            po_no: parsedData.contract?.po_no,
+            supplier: parsedData.contract?.supplier,
+            product: parsedData.contract?.product
+          });
+          result.contractId = await this.upsertContract(client, parsedData.contract, userId);
+          logger.info('Contract upserted successfully:', result.contractId);
+        } catch (contractError) {
+          logger.error('Failed to upsert contract:', contractError);
+          logger.error('Contract data:', JSON.stringify(parsedData.contract, null, 2));
+          throw contractError;
+        }
+      } else {
+        logger.info('No contract data found, attempting to resolve from prior processed data');
+        // Fallback: try to resolve existing contract id from prior processed data
+        result.contractId = await this.resolveContractId(client, parsedData);
+      }
+      
+      // 2. Route to Shipments or Trucking based on SEA / LAND field
+      // Get the sea_land value from contract data (normalized from "SEA / LAND" field)
+      const seaLandValue = parsedData.contract?.sea_land || parsedData.contract?.transport_mode || null;
+      const isLand = seaLandValue && seaLandValue.toString().toUpperCase().trim() === 'LAND';
+      const isSea = seaLandValue && seaLandValue.toString().toUpperCase().trim() === 'SEA';
+      
+      logger.info('Routing decision based on SEA / LAND:', {
+        sea_land: seaLandValue,
+        isLand,
+        isSea,
+        hasShipmentData: this.hasShipmentData(parsedData.shipment)
+      });
+      
+      // 2a. Create or update shipment (only if SEA / LAND = "SEA")
+      if (isSea && this.hasShipmentData(parsedData.shipment)) {
+        try {
+          // Extract vessel data from shipment object (where it's actually stored)
+          const vesselData = {
+            vessel_name: parsedData.shipment?.vessel_name,
+            vessel_code: parsedData.shipment?.vessel_code,
+            voyage_no: parsedData.shipment?.voyage_no,
+            vessel_owner: parsedData.shipment?.vessel_owner,
+            vessel_draft: parsedData.shipment?.vessel_draft,
+            vessel_loa: parsedData.shipment?.vessel_loa,
+            vessel_capacity: parsedData.shipment?.vessel_capacity,
+            vessel_hull_type: parsedData.shipment?.vessel_hull_type,
+            vessel_registration_year: parsedData.shipment?.vessel_registration_year || parsedData.vessel?.registration_year,
+            charter_type: parsedData.shipment?.charter_type || parsedData.vessel?.charter_type
+          };
+          
+          logger.info('Attempting to upsert shipment with data (SEA):', {
+            sto_no: parsedData.shipment?.sto_no,
+            vessel_name: vesselData.vessel_name,
+            contractId: result.contractId
+          });
+          result.shipmentId = await this.upsertShipment(
+            client,
+            parsedData.shipment,
+            result.contractId, // ensure we link shipment to whatever contract id we resolved
+            vesselData,
+            userId
+          );
+          logger.info('Shipment upserted successfully:', result.shipmentId);
+          
+          // Create or update vessel loading ports
+          await this.upsertVesselLoadingPorts(client, result.shipmentId, parsedData);
+          logger.info('Vessel loading ports processed for shipment:', result.shipmentId);
+        } catch (shipmentError) {
+          logger.error('Failed to upsert shipment:', shipmentError);
+          logger.error('Shipment data:', JSON.stringify(parsedData.shipment, null, 2));
+          throw shipmentError;
+        }
+      } else if (isLand && this.hasShipmentData(parsedData.shipment)) {
+        // 2b. Create trucking operation (if SEA / LAND = "LAND")
+        // Convert shipment data to trucking operation format
+        try {
+          logger.info('Creating trucking operation from shipment data (LAND):', {
+            sto_no: parsedData.shipment?.sto_no,
+            contractId: result.contractId
+          });
+          
+          // Convert shipment data to trucking operation format
+          const truckingDataFromShipment = {
+            sequence: 1,
+            data: {
+              cargo_readiness_at_starting_location: parsedData.shipment?.eta_vessel_arrival_loading_port_1 || null,
+              truck_loading_at_starting_location: parsedData.shipment?.vessel_loading_port_1 || null,
+              truck_unloading_at_starting_location: parsedData.shipment?.vessel_discharge_port || null,
+              trucking_owner_at_starting_location: parsedData.shipment?.vessel_owner || null,
+              trucking_oa_budget_at_starting_location: null,
+              trucking_oa_actual_at_starting_location: null,
+              quantity_sent_via_trucking_based_on_surat_jalan: parsedData.shipment?.quantity_at_loading_port_1_based_on_bast || null,
+              quantity_delivered_via_trucking: parsedData.shipment?.quantity_delivered || null,
+              trucking_gain_loss_at_starting_location: null,
+              trucking_starting_date_at_starting_location: parsedData.shipment?.eta_vessel_arrival_loading_port_1 || null,
+              trucking_completion_date_at_starting_location: parsedData.shipment?.ata_vessel_sailed_at_loading_port_1 || null
+            }
+          };
+          
+          const truckingId = await this.createTruckingOperation(
+            client,
+            undefined, // No shipment_id for LAND operations
+            result.contractId,
+            truckingDataFromShipment
+          );
+          if (truckingId) result.truckingOperationIds.push(truckingId);
+          logger.info('Trucking operation created successfully from shipment data:', truckingId);
+        } catch (truckingError) {
+          logger.error('Failed to create trucking operation from shipment data:', truckingError);
+          logger.error('Shipment data:', JSON.stringify(parsedData.shipment, null, 2));
+          throw truckingError;
+        }
+      } else {
+        logger.info('No shipment/trucking data found to upsert or SEA/LAND value not set');
+      }
+      
+      // 3. Create quality surveys (multiple) - only for SEA shipments
+      if (isSea && parsedData.quality && parsedData.quality.length > 0) {
+        for (const qualityData of parsedData.quality) {
+          const surveyId = await this.createQualitySurvey(
+            client,
+            result.shipmentId,
+            qualityData
+          );
+          if (surveyId) result.qualitySurveyIds.push(surveyId);
+        }
+      }
+      
+      // 4. Create trucking operations (multiple) - only if explicitly in trucking array and not LAND routing
+      // Note: For LAND, we already created trucking operations above from shipment data
+      if (!isLand && parsedData.trucking && parsedData.trucking.length > 0) {
+        for (const truckingData of parsedData.trucking) {
+          const truckingId = await this.createTruckingOperation(
+            client,
+            result.shipmentId,
+            result.contractId,
+            truckingData
+          );
+          if (truckingId) result.truckingOperationIds.push(truckingId);
+        }
+      }
+      
+      // 5. Create or update payment
+      if (this.hasPaymentData(parsedData.payment)) {
+        result.paymentId = await this.upsertPayment(
+          client,
+          parsedData.payment,
+          result.contractId
+        );
+      }
+      
+      return result;
+      
+    } catch (error) {
+      logger.error('Data distribution failed', error);
+      throw error;
+    }
+  }
+  
+  /**
+   * Create or update contract
+   */
+  private static async upsertContract(
+    client: PoolClient,
+    contractData: any,
+    userId?: string
+  ): Promise<string> {
+    const contractNumber = contractData.contract_no;
+    const poNumber = contractData.po_no;
+    
+    console.log('DEBUG upsertContract - Full contractData:', JSON.stringify(contractData, null, 2));
+    console.log('DEBUG upsertContract - contractNumber:', contractNumber);
+    console.log('DEBUG upsertContract - poNumber:', poNumber);
+    console.log('DEBUG upsertContract - Final contract_id will be:', contractNumber || `PO-${poNumber}`);
+    
+    if (!contractNumber && !poNumber) {
+      throw new Error('Contract number or PO number is required');
+    }
+    
+    // Check if contract exists
+    const existing = await client.query(
+      `SELECT id FROM contracts WHERE contract_id = $1 OR po_number = $2 LIMIT 1`,
+      [contractNumber, poNumber]
+    );
+    
+    if (existing.rows.length > 0) {
+      // Update existing contract
+      const contractId = existing.rows[0].id;
+      const quantity = this.parseNumber(contractData.contract_quantity);
+      const unitPrice = this.parseNumber(contractData.unit_price);
+      const contractValue = (quantity && unitPrice) ? quantity * unitPrice : null;
+      
+      await client.query(
+        `UPDATE contracts SET
+          contract_id = COALESCE($1, contract_id),
+          group_name = COALESCE($2, group_name),
+          supplier = COALESCE($3, supplier),
+          buyer = COALESCE($4, buyer),
+          contract_date = COALESCE($5::date, contract_date),
+          product = COALESCE($6, product),
+          po_number = COALESCE($7, po_number),
+          incoterm = COALESCE($8, incoterm),
+          transport_mode = COALESCE($9, transport_mode),
+          quantity_ordered = COALESCE($10::numeric, quantity_ordered),
+          unit_price = COALESCE($11::numeric, unit_price),
+          contract_value = COALESCE($12::numeric, contract_value),
+          delivery_start_date = COALESCE($13::date, delivery_start_date),
+          delivery_end_date = COALESCE($14::date, delivery_end_date),
+          source_type = COALESCE($15, source_type),
+          contract_type = COALESCE($16, contract_type),
+          status = COALESCE($17, status),
+          sto_number = COALESCE($18, sto_number),
+          sto_quantity = COALESCE($19::numeric, sto_quantity),
+          logistics_classification = COALESCE($20, logistics_classification),
+          po_classification = COALESCE($21, po_classification),
+          updated_at = CURRENT_TIMESTAMP
+         WHERE id = $22`,
+        [
+          contractNumber || `PO-${poNumber}`, // contract_id
+          contractData.group,
+          contractData.supplier,
+          contractData.buyer || contractData.group || null, // NEW: Use buyer field, fallback to group
+          this.parseDate(contractData.contract_date),
+          contractData.product,
+          poNumber,
+          contractData.incoterm,
+          contractData.sea_land || contractData.transport_mode,
+          quantity,
+          unitPrice,
+          contractValue,
+          this.parseDate(contractData.due_date_delivery_start),
+          this.parseDate(contractData.due_date_delivery_end),
+          contractData.source,
+          contractData.contract_type || contractData.ltc_spot, // UPDATED: Use contract_type (changed from B2B Flag)
+          'ACTIVE', // Force valid status
+          contractData.sto_no,
+          this.parseNumber(contractData.sto_quantity),
+          contractData.logistics_area_classification,
+          contractData.sto_classification || contractData.po_classification, // UPDATED: Use sto_classification (changed from PO Classification)
+          contractId
+        ]
+      );
+      return contractId;
+    } else {
+      // Create new contract
+      const quantity = this.parseNumber(contractData.contract_quantity);
+      const unitPrice = this.parseNumber(contractData.unit_price);
+      const contractValue = (quantity && unitPrice) ? quantity * unitPrice : null;
+      
+      const result = await client.query(
+        `INSERT INTO contracts (
+          contract_id, group_name, supplier, buyer, contract_date, product, po_number,
+          incoterm, transport_mode, quantity_ordered, unit, unit_price, contract_value,
+          delivery_start_date, delivery_end_date, source_type, contract_type,
+          status, sto_number, sto_quantity, logistics_classification, po_classification,
+          created_by
+        ) VALUES (
+          $1, $2, $3, $4, $5::date, $6, $7, $8, $9, $10::numeric, 'MT', $11::numeric, $12::numeric,
+          $13::date, $14::date, $15, $16, $17, $18, $19::numeric, $20, $21, $22
+        ) RETURNING id`,
+        [
+          contractNumber || `PO-${poNumber}`,
+          contractData.group,
+          contractData.supplier,
+          contractData.buyer || contractData.group || 'Unknown', // NEW: Use buyer field, fallback to group
+          this.parseDate(contractData.contract_date),
+          contractData.product,
+          poNumber,
+          contractData.incoterm,
+          contractData.sea_land || contractData.transport_mode,
+          quantity,
+          unitPrice,
+          contractValue,
+          this.parseDate(contractData.due_date_delivery_start),
+          this.parseDate(contractData.due_date_delivery_end),
+          contractData.source,
+          contractData.contract_type || contractData.ltc_spot, // UPDATED: Use contract_type (changed from B2B Flag)
+          'ACTIVE', // Force valid status
+          contractData.sto_no,
+          this.parseNumber(contractData.sto_quantity),
+          contractData.logistics_area_classification,
+          contractData.sto_classification || contractData.po_classification, // UPDATED: Use sto_classification (changed from PO Classification)
+          userId
+        ]
+      );
+      return result.rows[0].id;
+    }
+  }
+  
+  /**
+   * Create or update shipment
+   */
+  private static async upsertShipment(
+    client: PoolClient,
+    shipmentData: any,
+    contractId: string | undefined,
+    vesselData: any,
+    _userId?: string
+  ): Promise<string> {
+    const shipmentId = shipmentData.shipment_id || shipmentData.sto_no;
+    
+    if (!shipmentId) {
+      logger.warn('No shipment ID provided, skipping shipment creation');
+      return '';
+    }
+    
+    // Resolve existing shipment
+    const existing = await client.query(
+      `SELECT id FROM shipments WHERE shipment_id = $1 LIMIT 1`,
+      [shipmentId]
+    );
+
+    const voyageNo = vesselData.voyage_no || shipmentData.voyage_no;
+    const vesselCode = vesselData.vessel_code || shipmentData.vessel_code;
+    const vesselName = vesselData.vessel_name || shipmentData.vessel_name;
+    const vesselOwner = vesselData.vessel_owner || shipmentData.vessel_owner;
+
+    const vesselDraft = this.parseNumber(shipmentData.vessel_draft ?? vesselData.vessel_draft);
+    const vesselLoa = this.parseNumber(shipmentData.vessel_loa ?? vesselData.vessel_loa);
+    const vesselCapacity = this.parseNumber(shipmentData.vessel_capacity ?? vesselData.vessel_capacity);
+    const vesselHullType = vesselData.vessel_hull_type || shipmentData.vessel_hull_type;
+    const vesselRegistrationYear = this.parseInteger(shipmentData.vessel_registration_year ?? vesselData.vessel_registration_year);
+
+    const charterType = vesselData.charter_type || shipmentData.charter_type;
+    const loadingMethod = shipmentData.loading_method || null;
+    const dischargeMethod = shipmentData.discharge_method || null;
+
+    const portOfLoading = shipmentData.vessel_loading_port_1 || shipmentData.port_of_loading || shipmentData.loading_port || shipmentData.loading_port_1 || null;
+    const portOfDischarge = shipmentData.vessel_discharge_port || shipmentData.port_of_discharge || shipmentData.discharge_port || null;
+
+    const etaArrival = this.parseDate(shipmentData.eta_vessel_arrival_loading_port_1 || shipmentData.eta_arrival_loading_port_1);
+    const ataArrival = this.parseDate(shipmentData.ata_vessel_arrival_at_loading_port_1);
+    const etaSailed = this.parseDate(shipmentData.eta_vessel_sailed_at_loading_port_1);
+    const ataSailed = this.parseDate(shipmentData.ata_vessel_sailed_at_loading_port_1);
+
+    const shipmentDate = this.parseDate(shipmentData.shipment_date);
+    const arrivalDate = this.parseDate(shipmentData.arrival_date);
+
+    const quantityShipped = this.parseNumber(shipmentData.quantity_at_loading_port_1_based_on_bast ?? shipmentData.quantity_shipped);
+    const actualVesselQtyReceive = this.parseNumber(shipmentData.actual_vessel_qty_receive ?? shipmentData.quantity_delivered);
+    const blQuantity = this.parseNumber(shipmentData.bl_quantity);
+    const quantityDelivered = actualVesselQtyReceive ?? this.parseNumber(shipmentData.quantity_delivered);
+    let difference = this.parseNumber(shipmentData.difference_final_qty_vs_bl_qty);
+    if (difference === null && actualVesselQtyReceive !== null && blQuantity !== null) {
+      difference = actualVesselQtyReceive - blQuantity;
+    }
+
+    const estimatedKm = this.parseNumber(shipmentData.estimated_km);
+    const estimatedNm = this.parseNumber(shipmentData.estimated_nautical_miles ?? shipmentData.estimated_nm);
+    const vesselOaBudget = this.parseNumber(shipmentData.vessel_oa_budget);
+    const vesselOaActual = this.parseNumber(shipmentData.vessel_oa_actual);
+    const averageVesselSpeed = this.parseNumber(shipmentData.average_vessel_speed);
+
+    const etaLoadingStart = this.parseDate(shipmentData.eta_loading_start_at_loading_port_1);
+    const ataLoadingStart = this.parseDate(shipmentData.ata_loading_start_at_loading_port_1);
+    const etaLoadingComplete = this.parseDate(shipmentData.eta_loading_completed_at_loading_port_1);
+    const ataLoadingComplete = this.parseDate(shipmentData.ata_loading_completed_at_loading_port_1);
+
+    const etaDischargeArrival = this.parseDate(shipmentData.eta_arrival_at_discharge_port);
+    const ataDischargeArrival = this.parseDate(shipmentData.ata_vessel_arrival_at_discharge_port);
+    const etaDischargeStart = this.parseDate(shipmentData.eta_discharging_start_at_discharge_port);
+    const ataDischargeStart = this.parseDate(shipmentData.ata_discharging_start_at_discharge_port);
+    const etaDischargeComplete = this.parseDate(shipmentData.eta_discharging_completed_at_discharge_port);
+    const ataDischargeComplete = this.parseDate(shipmentData.ata_discharging_completed_at_discharge_port);
+
+    const loadingRate = this.parseNumber(shipmentData.loading_rate_at_loading_port_1);
+    const dischargeRate = this.parseNumber(shipmentData.discharge_rate_at_discharging_port);
+    const loadingDurationDays = this.parseInteger(shipmentData.loading_duration_days);
+    const dischargeDurationDays = this.parseInteger(shipmentData.discharge_duration_days);
+    const totalLeadTimeDays = this.parseInteger(shipmentData.total_lead_time_days);
+
+    const shipmentStatus = shipmentData.status ? String(shipmentData.status).trim().toUpperCase() : null;
+    const statusForInsert = shipmentStatus || 'PLANNED';
+
+    if (existing.rows.length > 0) {
+      const id = existing.rows[0].id;
+      await client.query(
+        `UPDATE shipments SET
+          contract_id = COALESCE($1::uuid, contract_id),
+          status = COALESCE($2, status),
+          voyage_no = COALESCE($3, voyage_no),
+          vessel_code = COALESCE($4, vessel_code),
+          vessel_name = COALESCE($5, vessel_name),
+          vessel_owner = COALESCE($6, vessel_owner),
+          vessel_draft = COALESCE($7::numeric, vessel_draft),
+          vessel_loa = COALESCE($8::numeric, vessel_loa),
+          vessel_capacity = COALESCE($9::numeric, vessel_capacity),
+          vessel_hull_type = COALESCE($10, vessel_hull_type),
+          vessel_registration_year = COALESCE($11::int, vessel_registration_year),
+          charter_type = COALESCE($12, charter_type),
+          loading_method = COALESCE($13, loading_method),
+          discharge_method = COALESCE($14, discharge_method),
+          port_of_loading = COALESCE($15, port_of_loading),
+          port_of_discharge = COALESCE($16, port_of_discharge),
+          eta_arrival = COALESCE($17::date, eta_arrival),
+          ata_arrival = COALESCE($18::date, ata_arrival),
+          eta_sailed = COALESCE($19::date, eta_sailed),
+          ata_sailed = COALESCE($20::date, ata_sailed),
+          shipment_date = COALESCE($21::date, shipment_date),
+          arrival_date = COALESCE($22::date, arrival_date),
+          quantity_shipped = COALESCE($23::numeric, quantity_shipped),
+          quantity_delivered = COALESCE($24::numeric, quantity_delivered),
+          bl_quantity = COALESCE($25::numeric, bl_quantity),
+          actual_vessel_qty_receive = COALESCE($26::numeric, actual_vessel_qty_receive),
+          difference_final_qty_vs_bl_qty = COALESCE($27::numeric, difference_final_qty_vs_bl_qty),
+          estimated_km = COALESCE($28::numeric, estimated_km),
+          estimated_nautical_miles = COALESCE($29::numeric, estimated_nautical_miles),
+          vessel_oa_budget = COALESCE($30::numeric, vessel_oa_budget),
+          vessel_oa_actual = COALESCE($31::numeric, vessel_oa_actual),
+          average_vessel_speed = COALESCE($32::numeric, average_vessel_speed),
+          eta_loading_start = COALESCE($33::date, eta_loading_start),
+          ata_loading_start = COALESCE($34::date, ata_loading_start),
+          eta_loading_complete = COALESCE($35::date, eta_loading_complete),
+          ata_loading_complete = COALESCE($36::date, ata_loading_complete),
+          eta_discharge_arrival = COALESCE($37::date, eta_discharge_arrival),
+          ata_discharge_arrival = COALESCE($38::date, ata_discharge_arrival),
+          eta_discharge_start = COALESCE($39::date, eta_discharge_start),
+          ata_discharge_start = COALESCE($40::date, ata_discharge_start),
+          eta_discharge_complete = COALESCE($41::date, eta_discharge_complete),
+          ata_discharge_complete = COALESCE($42::date, ata_discharge_complete),
+          loading_rate = COALESCE($43::numeric, loading_rate),
+          discharge_rate = COALESCE($44::numeric, discharge_rate),
+          loading_duration_days = COALESCE($45::int, loading_duration_days),
+          discharge_duration_days = COALESCE($46::int, discharge_duration_days),
+          total_lead_time_days = COALESCE($47::int, total_lead_time_days),
+          updated_at = CURRENT_TIMESTAMP
+         WHERE id = $48`,
+        [
+          contractId,
+          shipmentStatus,
+          voyageNo,
+          vesselCode,
+          vesselName,
+          vesselOwner,
+          vesselDraft,
+          vesselLoa,
+          vesselCapacity,
+          vesselHullType,
+          vesselRegistrationYear,
+          charterType,
+          loadingMethod,
+          dischargeMethod,
+          portOfLoading,
+          portOfDischarge,
+          etaArrival,
+          ataArrival,
+          etaSailed,
+          ataSailed,
+          shipmentDate,
+          arrivalDate,
+          quantityShipped,
+          quantityDelivered,
+          blQuantity,
+          actualVesselQtyReceive,
+          difference,
+          estimatedKm,
+          estimatedNm,
+          vesselOaBudget,
+          vesselOaActual,
+          averageVesselSpeed,
+          etaLoadingStart,
+          ataLoadingStart,
+          etaLoadingComplete,
+          ataLoadingComplete,
+          etaDischargeArrival,
+          ataDischargeArrival,
+          etaDischargeStart,
+          ataDischargeStart,
+          etaDischargeComplete,
+          ataDischargeComplete,
+          loadingRate,
+          dischargeRate,
+          loadingDurationDays,
+          dischargeDurationDays,
+          totalLeadTimeDays,
+          id
+        ]
+      );
+      return id;
+    } else {
+      const result = await client.query(
+        `INSERT INTO shipments (
+          shipment_id, contract_id, status, voyage_no, vessel_code, vessel_name, vessel_owner,
+          vessel_draft, vessel_loa, vessel_capacity, vessel_hull_type, vessel_registration_year,
+          charter_type, loading_method, discharge_method, port_of_loading, port_of_discharge,
+          eta_arrival, ata_arrival, eta_sailed, ata_sailed, shipment_date, arrival_date,
+          quantity_shipped, quantity_delivered, bl_quantity, actual_vessel_qty_receive,
+          difference_final_qty_vs_bl_qty, estimated_km, estimated_nautical_miles, vessel_oa_budget,
+          vessel_oa_actual, average_vessel_speed, eta_loading_start, ata_loading_start,
+          eta_loading_complete, ata_loading_complete, eta_discharge_arrival, ata_discharge_arrival,
+          eta_discharge_start, ata_discharge_start, eta_discharge_complete, ata_discharge_complete,
+          loading_rate, discharge_rate, loading_duration_days, discharge_duration_days,
+          total_lead_time_days
+        ) VALUES (
+          $1, $2::uuid, $3, $4, $5, $6, $7, $8::numeric, $9::numeric, $10::numeric, $11, $12::int,
+          $13, $14, $15, $16, $17, $18::date, $19::date, $20::date, $21::date, $22::date, $23::date,
+          $24::numeric, $25::numeric, $26::numeric, $27::numeric, $28::numeric, $29::numeric, $30::numeric,
+          $31::numeric, $32::numeric, $33::numeric, $34::date, $35::date, $36::date, $37::date,
+          $38::date, $39::date, $40::date, $41::date, $42::date, $43::date, $44::numeric, $45::numeric,
+          $46::int, $47::int, $48::int
+        ) RETURNING id`,
+        [
+          shipmentId,
+          contractId,
+          statusForInsert,
+          voyageNo,
+          vesselCode,
+          vesselName,
+          vesselOwner,
+          vesselDraft,
+          vesselLoa,
+          vesselCapacity,
+          vesselHullType,
+          vesselRegistrationYear,
+          charterType,
+          loadingMethod,
+          dischargeMethod,
+          portOfLoading,
+          portOfDischarge,
+          etaArrival,
+          ataArrival,
+          etaSailed,
+          ataSailed,
+          shipmentDate,
+          arrivalDate,
+          quantityShipped,
+          quantityDelivered,
+          blQuantity,
+          actualVesselQtyReceive,
+          difference,
+          estimatedKm,
+          estimatedNm,
+          vesselOaBudget,
+          vesselOaActual,
+          averageVesselSpeed,
+          etaLoadingStart,
+          ataLoadingStart,
+          etaLoadingComplete,
+          ataLoadingComplete,
+          etaDischargeArrival,
+          ataDischargeArrival,
+          etaDischargeStart,
+          ataDischargeStart,
+          etaDischargeComplete,
+          ataDischargeComplete,
+          loadingRate,
+          dischargeRate,
+          loadingDurationDays,
+          dischargeDurationDays,
+          totalLeadTimeDays
+        ]
+      );
+      return result.rows[0].id;
+    }
+  }
+  
+  /**
+   * Create or update vessel loading ports
+   */
+  private static async upsertVesselLoadingPorts(
+    client: PoolClient,
+    shipmentId: string,
+    parsedData: any
+  ): Promise<void> {
+    if (!shipmentId) return;
+    
+    const shipmentData = parsedData.shipment || {};
+
+    const qualityByLocation = new Map<string, Record<string, any>>();
+    if (Array.isArray(parsedData.quality)) {
+      for (const qualityItem of parsedData.quality) {
+        if (!qualityItem || !qualityItem.location) continue;
+        qualityByLocation.set(qualityItem.location, qualityItem.data || {});
+      }
+    }
+
+    const mapQualityColumns = (location: string) => {
+      const qualityData = qualityByLocation.get(location);
+      const mapped: any = {};
+      if (!qualityData) {
+        return mapped;
+      }
+
+      for (const [key, rawValue] of Object.entries(qualityData)) {
+        const normalizedKey = key.toLowerCase();
+        if (normalizedKey.includes('ffa')) {
+          mapped.quality_ffa = this.parseNumber(rawValue);
+        } else if (normalizedKey.includes('m_i') || normalizedKey.includes('mi')) {
+          mapped.quality_mi = this.parseNumber(rawValue);
+        } else if (normalizedKey.includes('dobi')) {
+          mapped.quality_dobi = this.parseNumber(rawValue);
+        } else if (normalizedKey.includes('red')) {
+          mapped.quality_red = this.parseNumber(rawValue);
+        } else if (normalizedKey.includes('d_s') || normalizedKey.includes('d&s') || normalizedKey.includes('ds')) {
+          mapped.quality_ds = this.parseNumber(rawValue);
+        } else if (normalizedKey.includes('stone')) {
+          mapped.quality_stone = this.parseNumber(rawValue);
+        }
+      }
+
+      return mapped;
+    };
+
+    const loadingPorts: Array<Record<string, any>> = [];
+
+    // Loading Port 1
+    if (shipmentData.vessel_loading_port_1 || shipmentData.quantity_at_loading_port_1_based_on_bast || qualityByLocation.has('Loading Port 1')) {
+      loadingPorts.push({
+        port_name: shipmentData.vessel_loading_port_1 || 'Loading Port 1',
+        port_sequence: 1,
+        quantity_at_loading_port: this.parseNumber(shipmentData.quantity_at_loading_port_1_based_on_bast),
+        eta_vessel_arrival: this.parseDate(shipmentData.eta_vessel_arrival_loading_port_1),
+        ata_vessel_arrival: this.parseDate(shipmentData.ata_vessel_arrival_at_loading_port_1),
+        eta_vessel_berthed: this.parseDate(shipmentData.eta_vessel_berthed_at_loading_port_1),
+        ata_vessel_berthed: this.parseDate(shipmentData.ata_vessel_berthed_at_loading_port_1),
+        eta_loading_start: this.parseDate(shipmentData.eta_loading_start_at_loading_port_1),
+        ata_loading_start: this.parseDate(shipmentData.ata_loading_start_at_loading_port_1),
+        eta_loading_completed: this.parseDate(shipmentData.eta_loading_completed_at_loading_port_1),
+        ata_loading_completed: this.parseDate(shipmentData.ata_loading_completed_at_loading_port_1),
+        eta_vessel_sailed: this.parseDate(shipmentData.eta_vessel_sailed_at_loading_port_1),
+        ata_vessel_sailed: this.parseDate(shipmentData.ata_vessel_sailed_at_loading_port_1),
+        loading_rate: this.parseNumber(shipmentData.loading_rate_at_loading_port_1),
+        is_discharge_port: false,
+        ...mapQualityColumns('Loading Port 1')
+      });
+    }
+
+    // Loading Port 2
+    if (shipmentData.vessel_loading_port_2 || shipmentData.quantity_at_loading_port_2 || qualityByLocation.has('Loading Port 2')) {
+      loadingPorts.push({
+        port_name: shipmentData.vessel_loading_port_2 || 'Loading Port 2',
+        port_sequence: 2,
+        quantity_at_loading_port: this.parseNumber(shipmentData.quantity_at_loading_port_2),
+        eta_vessel_arrival: this.parseDate(shipmentData.eta_vessel_arrival_at_loading_port_2),
+        ata_vessel_arrival: this.parseDate(shipmentData.ata_vessel_arrival_at_loading_port_2),
+        eta_vessel_berthed: this.parseDate(shipmentData.eta_vessel_berthed_at_loading_port_2),
+        ata_vessel_berthed: this.parseDate(shipmentData.ata_vessel_berthed_at_loading_port_2),
+        eta_loading_start: this.parseDate(shipmentData.eta_loading_start_at_loading_port_2),
+        ata_loading_start: this.parseDate(shipmentData.ata_loading_start_at_loading_port_2),
+        eta_loading_completed: this.parseDate(shipmentData.eta_loading_completed_at_loading_port_2),
+        ata_loading_completed: this.parseDate(shipmentData.ata_loading_completed_at_loading_port_2),
+        eta_vessel_sailed: this.parseDate(shipmentData.eta_vessel_sailed_at_loading_port_2),
+        ata_vessel_sailed: this.parseDate(shipmentData.ata_vessel_sailed_at_loading_port_2),
+        loading_rate: this.parseNumber(shipmentData.loading_rate_at_loading_port_2),
+        is_discharge_port: false,
+        ...mapQualityColumns('Loading Port 2')
+      });
+    }
+
+    // Loading Port 3
+    if (shipmentData.vessel_loading_port_3 || shipmentData.quantity_at_loading_port_3 || qualityByLocation.has('Loading Port 3')) {
+      loadingPorts.push({
+        port_name: shipmentData.vessel_loading_port_3 || 'Loading Port 3',
+        port_sequence: 3,
+        quantity_at_loading_port: this.parseNumber(shipmentData.quantity_at_loading_port_3),
+        eta_vessel_arrival: this.parseDate(shipmentData.eta_vessel_arrival_at_loading_port_3),
+        ata_vessel_arrival: this.parseDate(shipmentData.ata_vessel_arrival_at_loading_port_3),
+        eta_vessel_berthed: this.parseDate(shipmentData.eta_vessel_berthed_at_loading_port_3),
+        ata_vessel_berthed: this.parseDate(shipmentData.ata_vessel_berthed_at_loading_port_3),
+        eta_loading_start: this.parseDate(shipmentData.eta_loading_start_at_loading_port_3),
+        ata_loading_start: this.parseDate(shipmentData.ata_loading_start_at_loading_port_3),
+        eta_loading_completed: this.parseDate(shipmentData.eta_loading_completed_at_loading_port_3),
+        ata_loading_completed: this.parseDate(shipmentData.ata_loading_completed_at_loading_port_3),
+        eta_vessel_sailed: this.parseDate(shipmentData.eta_vessel_sailed_at_loading_port_3),
+        ata_vessel_sailed: this.parseDate(shipmentData.ata_vessel_sailed_at_loading_port_3),
+        loading_rate: this.parseNumber(shipmentData.loading_rate_at_loading_port_3),
+        is_discharge_port: false,
+        ...mapQualityColumns('Loading Port 3')
+      });
+    }
+
+    // Discharge Port entry (if data available)
+    const dischargeQuality = mapQualityColumns('Discharge Port');
+    const dischargePortName = shipmentData.vessel_discharge_port || shipmentData.port_of_discharge || null;
+    const dischargeQuantity = this.parseNumber(shipmentData.actual_vessel_qty_receive ?? shipmentData.quantity_delivered);
+    const dischargeRate = this.parseNumber(shipmentData.discharge_rate_at_discharging_port);
+
+    if (dischargePortName || Object.keys(dischargeQuality).length > 0) {
+      loadingPorts.push({
+        port_name: dischargePortName || 'Discharge Port',
+        port_sequence: 999,
+        quantity_at_loading_port: dischargeQuantity,
+        eta_vessel_arrival: this.parseDate(shipmentData.eta_arrival_at_discharge_port),
+        ata_vessel_arrival: this.parseDate(shipmentData.ata_vessel_arrival_at_discharge_port),
+        eta_vessel_berthed: this.parseDate(shipmentData.eta_vessel_berthed_at_discharge_port),
+        ata_vessel_berthed: this.parseDate(shipmentData.ata_vessel_berthed_at_discharge_port),
+        eta_loading_start: this.parseDate(shipmentData.eta_discharging_start_at_discharge_port),
+        ata_loading_start: this.parseDate(shipmentData.ata_discharging_start_at_discharge_port),
+        eta_loading_completed: this.parseDate(shipmentData.eta_discharging_completed_at_discharge_port),
+        ata_loading_completed: this.parseDate(shipmentData.ata_discharging_completed_at_discharge_port),
+        eta_vessel_sailed: this.parseDate(shipmentData.eta_discharging_completed_at_discharge_port),
+        ata_vessel_sailed: this.parseDate(shipmentData.ata_discharging_completed_at_discharge_port),
+        loading_rate: dischargeRate,
+        is_discharge_port: true,
+        ...dischargeQuality
+      });
+    }
+
+    for (const port of loadingPorts) {
+      if (!port.port_name) {
+        continue;
+      }
+
+      const existing = await client.query(
+        `SELECT id FROM vessel_loading_ports 
+         WHERE shipment_id = $1 
+           AND port_sequence = $2
+           AND COALESCE(is_discharge_port, false) = $3
+         LIMIT 1`,
+        [shipmentId, port.port_sequence, port.is_discharge_port === true]
+      );
+
+      if (existing.rows.length > 0) {
+        const updateValues = [
+          existing.rows[0].id,
+          port.port_name,
+          port.port_sequence,
+          port.quantity_at_loading_port,
+          port.eta_vessel_arrival,
+          port.ata_vessel_arrival,
+          port.eta_vessel_berthed,
+          port.ata_vessel_berthed,
+          port.eta_loading_start,
+          port.ata_loading_start,
+          port.eta_loading_completed,
+          port.ata_loading_completed,
+          port.eta_vessel_sailed,
+          port.ata_vessel_sailed,
+          port.loading_rate,
+          port.quality_ffa ?? null,
+          port.quality_mi ?? null,
+          port.quality_dobi ?? null,
+          port.quality_red ?? null,
+          port.quality_ds ?? null,
+          port.quality_stone ?? null,
+          port.is_discharge_port === true,
+          shipmentId
+        ];
+
+        await client.query(
+          `UPDATE vessel_loading_ports SET
+             port_name = $2,
+             port_sequence = $3,
+             quantity_at_loading_port = $4::numeric,
+             eta_vessel_arrival = $5::timestamp,
+             ata_vessel_arrival = $6::timestamp,
+             eta_vessel_berthed = $7::timestamp,
+             ata_vessel_berthed = $8::timestamp,
+             eta_loading_start = $9::timestamp,
+             ata_loading_start = $10::timestamp,
+             eta_loading_completed = $11::timestamp,
+             ata_loading_completed = $12::timestamp,
+             eta_vessel_sailed = $13::timestamp,
+             ata_vessel_sailed = $14::timestamp,
+             loading_rate = $15::numeric,
+             quality_ffa = $16::numeric,
+             quality_mi = $17::numeric,
+             quality_dobi = $18::numeric,
+             quality_red = $19::numeric,
+             quality_ds = $20::numeric,
+             quality_stone = $21::numeric,
+             is_discharge_port = $22::boolean,
+             updated_at = CURRENT_TIMESTAMP
+           WHERE id = $1 AND shipment_id = $23`,
+          updateValues
+        );
+      } else {
+        await client.query(
+          `INSERT INTO vessel_loading_ports (
+             shipment_id, port_name, port_sequence, quantity_at_loading_port,
+             eta_vessel_arrival, ata_vessel_arrival, eta_vessel_berthed, ata_vessel_berthed,
+             eta_loading_start, ata_loading_start, eta_loading_completed, ata_loading_completed,
+             eta_vessel_sailed, ata_vessel_sailed, loading_rate,
+             quality_ffa, quality_mi, quality_dobi, quality_red, quality_ds, quality_stone,
+             is_discharge_port
+           ) VALUES (
+             $1::uuid, $2, $3, $4::numeric,
+             $5::timestamp, $6::timestamp, $7::timestamp, $8::timestamp,
+             $9::timestamp, $10::timestamp, $11::timestamp, $12::timestamp,
+             $13::timestamp, $14::timestamp, $15::numeric,
+             $16::numeric, $17::numeric, $18::numeric, $19::numeric, $20::numeric, $21::numeric,
+             $22::boolean
+           )`,
+          [
+            shipmentId,
+            port.port_name,
+            port.port_sequence,
+            port.quantity_at_loading_port,
+            port.eta_vessel_arrival,
+            port.ata_vessel_arrival,
+            port.eta_vessel_berthed,
+            port.ata_vessel_berthed,
+            port.eta_loading_start,
+            port.ata_loading_start,
+            port.eta_loading_completed,
+            port.ata_loading_completed,
+            port.eta_vessel_sailed,
+            port.ata_vessel_sailed,
+            port.loading_rate,
+            port.quality_ffa ?? null,
+            port.quality_mi ?? null,
+            port.quality_dobi ?? null,
+            port.quality_red ?? null,
+            port.quality_ds ?? null,
+            port.quality_stone ?? null,
+            port.is_discharge_port === true
+          ]
+        );
+      }
+    }
+  }
+  
+  /**
+   * Create quality survey
+   */
+  private static async createQualitySurvey(
+    client: PoolClient,
+    shipmentId: string | undefined,
+    qualityData: any
+  ): Promise<string | null> {
+    if (!shipmentId) return null;
+    
+    const data = qualityData.data;
+    if (!data || Object.keys(data).length === 0) return null;
+    
+    const result = await client.query(
+      `INSERT INTO quality_surveys (
+        shipment_id, location, ffa, moisture, impurity, iv, dobi, color_red, dirt_sand, stone
+      ) VALUES (
+        $1::uuid, $2, $3::numeric, $4::numeric, $5::numeric, $6::numeric, 
+        $7::numeric, $8::numeric, $9::numeric, $10::numeric
+      ) RETURNING id`,
+      [
+        shipmentId,
+        qualityData.location,
+        this.parseNumber(data.ffa),
+        this.parseNumber(data.m_i),
+        this.parseNumber(data.m_i), // M&I covers moisture and impurity
+        this.parseNumber(data.iv),
+        this.parseNumber(data.dobi),
+        this.parseNumber(data.color_red),
+        this.parseNumber(data.d_s),
+        this.parseNumber(data.stone)
+      ]
+    );
+    
+    return result.rows[0].id;
+  }
+  
+  /**
+   * Create trucking operation
+   */
+  private static async createTruckingOperation(
+    client: PoolClient,
+    shipmentId: string | undefined,
+    contractId: string | undefined,
+    truckingData: any
+  ): Promise<string | null> {
+    if (!shipmentId && !contractId) return null;
+    
+    const data = truckingData.data;
+    if (!data || Object.keys(data).length === 0) return null;
+    
+    const result = await client.query(
+      `INSERT INTO trucking_operations (
+        shipment_id, contract_id, location_sequence, cargo_readiness_date,
+        loading_location, unloading_location, trucking_owner,
+        oa_budget, oa_actual, quantity_sent, quantity_delivered, gain_loss,
+        trucking_start_date, trucking_completion_date
+      ) VALUES (
+        $1::uuid, $2::uuid, $3, $4::date, $5, $6, $7,
+        $8::numeric, $9::numeric, $10::numeric, $11::numeric, $12::numeric,
+        $13::date, $14::date
+      ) RETURNING id`,
+      [
+        shipmentId,
+        contractId,
+        truckingData.sequence,
+        this.parseDate(data.cargo_readiness_at_starting_location),
+        data.truck_loading_at_starting_location,
+        data.truck_unloading_at_starting_location,
+        data.trucking_owner_at_starting_location,
+        this.parseNumber(data.trucking_oa_budget_at_starting_location),
+        this.parseNumber(data.trucking_oa_actual_at_starting_location),
+        this.parseNumber(data.quantity_sent_via_trucking_based_on_surat_jalan),
+        this.parseNumber(data.quantity_delivered_via_trucking),
+        this.parseNumber(data.trucking_gain_loss_at_starting_location),
+        this.parseDate(data.trucking_starting_date_at_starting_location),
+        this.parseDate(data.trucking_completion_date_at_starting_location)
+      ]
+    );
+    
+    return result.rows[0].id;
+  }
+  
+  /**
+   * Create or update payment
+   */
+  private static async upsertPayment(
+    client: PoolClient,
+    paymentData: any,
+    contractId: string | undefined
+  ): Promise<string> {
+    if (!contractId) {
+      throw new Error('Contract ID is required for payment');
+    }
+    
+    // Check if payment exists for this contract
+    const existing = await client.query(
+      `SELECT id FROM payments WHERE contract_id = $1 ORDER BY created_at DESC LIMIT 1`,
+      [contractId]
+    );
+    
+    if (existing.rows.length > 0) {
+      // Update existing payment
+      const paymentId = existing.rows[0].id;
+      await client.query(
+        `UPDATE payments SET
+          payment_due_date = COALESCE($1::date, payment_due_date),
+          dp_date = COALESCE($2::date, dp_date),
+          payoff_date = COALESCE($3::date, payoff_date),
+          payment_date = COALESCE($4::date, payment_date),
+          payment_deviation_days = COALESCE($5::int, payment_deviation_days),
+          updated_at = CURRENT_TIMESTAMP
+         WHERE id = $6`,
+        [
+          this.parseDate(paymentData.due_date_payment),
+          this.parseDate(paymentData.dp_date),
+          this.parseDate(paymentData.payoff_date),
+          this.parseDate(paymentData.payoff_date), // Use payoff as payment date
+          this.parseNumber(paymentData.payment_date_deviation_days),
+          paymentId
+        ]
+      );
+      return paymentId;
+    } else {
+      // Create new payment
+      const result = await client.query(
+        `INSERT INTO payments (
+          contract_id, payment_due_date, dp_date, payoff_date, payment_date,
+          payment_deviation_days, payment_status, payment_amount
+        ) VALUES (
+          $1::uuid, $2::date, $3::date, $4::date, $5::date, $6::int, 'PENDING', 0
+        ) RETURNING id`,
+        [
+          contractId,
+          this.parseDate(paymentData.due_date_payment),
+          this.parseDate(paymentData.dp_date),
+          this.parseDate(paymentData.payoff_date),
+          this.parseDate(paymentData.payoff_date),
+          this.parseNumber(paymentData.payment_date_deviation_days)
+        ]
+      );
+      return result.rows[0].id;
+    }
+  }
+  
+  /**
+   * Helper: Check if has contract data
+   */
+  private static hasContractData(contractData: any, parsedData?: any): boolean {
+    if (!contractData) return false;
+    // Accept if we have either a contract number or a PO number (common cases)
+    if (contractData.contract_no || contractData.po_no) return true;
+    // Relax condition: allow when STO exists and we have key attributes to update
+    const hasSto = parsedData?.shipment?.sto_no || contractData?.sto_no;
+    const hasBasicAttrs =
+      !!(contractData.group || contractData.supplier || contractData.product || contractData.contract_quantity);
+    return !!(hasSto && hasBasicAttrs);
+  }
+  
+  /**
+   * Helper: Check if has shipment data
+   */
+  private static hasShipmentData(shipmentData: any): boolean {
+    return shipmentData && (shipmentData.shipment_id || shipmentData.sto_no);
+  }
+  
+  /**
+   * Helper: Check if has payment data
+   */
+  private static hasPaymentData(paymentData: any): boolean {
+    return paymentData && Object.keys(paymentData).length > 0;
+  }
+  
+  /**
+   * Helper: Parse date from various formats
+   */
+  private static parseDate(value: any): string | null {
+    if (!value) return null;
+    
+    try {
+      // Handle Excel date formats
+      if (typeof value === 'string') {
+        // Try explicit MM/DD/YY(YY) first (observed in data: e.g., 1/31/25)
+        const mdYMatch = value.match(/^(\d{1,2})\/(\d{1,2})\/(\d{2,4})$/);
+        if (mdYMatch) {
+          const m = parseInt(mdYMatch[1], 10);
+          const d = parseInt(mdYMatch[2], 10);
+          let y = parseInt(mdYMatch[3], 10);
+          if (mdYMatch[3].length === 2) {
+            y = 2000 + y;
+          }
+          if (m >= 1 && m <= 12 && d >= 1 && d <= 31) {
+            const iso = new Date(Date.UTC(y, m - 1, d)).toISOString().split('T')[0];
+            return iso;
+          }
+        }
+        
+        // Try different general formats
+        const formats = [
+          /(\d{1,2})-([A-Za-z]{3})-(\d{2})/,  // 1-Sep-25
+          /(\d{4})-(\d{2})-(\d{2})/,          // 2025-09-01
+          /(\d{2})\/(\d{2})\/(\d{4})/         // 01/09/2025
+        ];
+        
+        for (const format of formats) {
+          const match = value.match(format);
+          if (match) {
+            const date = new Date(value);
+            if (!isNaN(date.getTime())) {
+              return date.toISOString().split('T')[0];
+            }
+          }
+        }
+      }
+      
+      return null;
+    } catch (error) {
+      return null;
+    }
+  }
+  
+  private static parseInteger(value: any): number | null {
+    if (value === undefined || value === null || value === '') {
+      return null;
+    }
+
+    try {
+      const cleaned = typeof value === 'string'
+        ? value.replace(/[^0-9\-]/g, '')
+        : value;
+      const parsed = parseInt(cleaned, 10);
+      return Number.isNaN(parsed) ? null : parsed;
+    } catch (error) {
+      return null;
+    }
+  }
+
+  /**
+   * Helper: Parse number from various formats
+   */
+  private static parseNumber(value: any): number | null {
+    if (!value) return null;
+    
+    try {
+      // Remove commas and spaces
+      const cleaned = typeof value === 'string' 
+        ? value.replace(/[,\s]/g, '')
+        : value;
+      
+      const num = parseFloat(cleaned);
+      return isNaN(num) ? null : num;
+    } catch (error) {
+      return null;
+    }
+  }
+}
+
