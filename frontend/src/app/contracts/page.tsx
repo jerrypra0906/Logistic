@@ -102,6 +102,28 @@ export default function ContractsPage() {
   const [totalContracts, setTotalContracts] = useState(0)
   const contractsPerPage = 100
 
+  type ColumnFilter =
+    | { type: 'text'; value: string; exact?: boolean; emptyOnly?: boolean }
+    | { type: 'number'; min?: string; max?: string; emptyOnly?: boolean }
+    | { type: 'date'; from?: string; to?: string; emptyOnly?: boolean }
+
+  const [columnFilters, setColumnFilters] = useState<Record<string, ColumnFilter>>({})
+  const [openHeaderFilterId, setOpenHeaderFilterId] = useState<string | null>(null)
+  const headerFilterPopoverRef = useRef<HTMLDivElement | null>(null)
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return
+    const onMouseDown = (e: MouseEvent) => {
+      if (!openHeaderFilterId) return
+      const el = headerFilterPopoverRef.current
+      if (!el) return
+      if (e.target instanceof Node && el.contains(e.target)) return
+      setOpenHeaderFilterId(null)
+    }
+    window.addEventListener('mousedown', onMouseDown)
+    return () => window.removeEventListener('mousedown', onMouseDown)
+  }, [openHeaderFilterId])
+
   // This page mounts even while <Layout> is still checking localStorage.
   // Avoid firing API calls until a token exists.
   useEffect(() => {
@@ -404,18 +426,112 @@ export default function ContractsPage() {
     }
   }, [selectedContract])
 
-  // Only filter by search term on frontend - all other filters are handled by backend
-  const filteredContracts = useMemo(() => contracts.filter(contract => {
-    if (searchTerm === '') return true
-    
-    return contract.contract_id?.toLowerCase().includes(searchTerm.toLowerCase()) ||
-      contract.po_number?.toLowerCase().includes(searchTerm.toLowerCase()) ||
-      contract.po_numbers?.toLowerCase().includes(searchTerm.toLowerCase()) ||
-      contract.sto_number?.toLowerCase().includes(searchTerm.toLowerCase()) ||
-      contract.sto_numbers?.toLowerCase().includes(searchTerm.toLowerCase()) ||
-      contract.supplier?.toLowerCase().includes(searchTerm.toLowerCase()) ||
-      contract.product?.toLowerCase().includes(searchTerm.toLowerCase())
-  }), [contracts, searchTerm])
+  const getFilterTypeForColumn = (colId: string): ColumnFilter['type'] => {
+    if (colId === 'contract_qty' || colId === 'outstanding_qty') return 'number'
+    if (colId === 'contract_date' || colId === 'delivery_start' || colId === 'delivery_end' || colId === 'created_at') return 'date'
+    return 'text'
+  }
+
+  const getColumnRawValue = (c: Contract, colId: string): string | number | null => {
+    switch (colId) {
+      case 'contract_id':
+        return c.contract_id || ''
+      case 'product':
+        return c.product || ''
+      case 'status':
+        return (c.import_status || c.status || '')
+      case 'contract_date':
+        return c.contract_date || ''
+      case 'company_code':
+        return c.company_code || ''
+      case 'lt_spot':
+        return c.lt_spot || ''
+      case 'po_number':
+        return c.po_numbers || c.po_number || ''
+      case 'sto_number':
+        return c.sto_numbers || c.sto_number || ''
+      case 'contract_qty':
+        return typeof c.quantity_ordered === 'number' ? c.quantity_ordered : null
+      case 'outstanding_qty':
+        return typeof c.outstanding_quantity === 'number' ? c.outstanding_quantity : null
+      case 'delivery_start':
+        return c.delivery_start_date || ''
+      case 'delivery_end':
+        return c.delivery_end_date || ''
+      case 'created_at':
+        return c.created_at || ''
+      default:
+        return (c as any)[colId] ?? ''
+    }
+  }
+
+  const isEmptyValue = (v: unknown) => {
+    if (v === null || v === undefined) return true
+    const s = String(v).trim()
+    return s === '' || s === '-' || s.toLowerCase() === 'null' || s.toLowerCase() === 'undefined'
+  }
+
+  const passesColumnFilters = (c: Contract) => {
+    for (const [colId, filter] of Object.entries(columnFilters)) {
+      const raw = getColumnRawValue(c, colId)
+      if (filter.emptyOnly) {
+        if (!isEmptyValue(raw)) return false
+        continue
+      }
+
+      if (filter.type === 'text') {
+        const needle = (filter.value || '').trim().toLowerCase()
+        if (!needle) continue
+        const hay = String(raw ?? '').toLowerCase()
+        if (filter.exact) {
+          if (hay.trim() !== needle) return false
+        } else {
+          if (!hay.includes(needle)) return false
+        }
+      }
+
+      if (filter.type === 'number') {
+        const n = typeof raw === 'number' ? raw : Number(String(raw ?? '').replace(/,/g, ''))
+        if (Number.isNaN(n)) return false
+        const min = filter.min !== undefined && filter.min !== '' ? Number(filter.min) : null
+        const max = filter.max !== undefined && filter.max !== '' ? Number(filter.max) : null
+        if (min !== null && !Number.isNaN(min) && n < min) return false
+        if (max !== null && !Number.isNaN(max) && n > max) return false
+      }
+
+      if (filter.type === 'date') {
+        const rawStr = String(raw ?? '').trim()
+        if (!rawStr) return false
+        const rawTime = Date.parse(rawStr)
+        if (Number.isNaN(rawTime)) return false
+        const fromTime = filter.from ? Date.parse(filter.from) : null
+        const toTime = filter.to ? Date.parse(filter.to) : null
+        if (fromTime !== null && !Number.isNaN(fromTime) && rawTime < fromTime) return false
+        if (toTime !== null && !Number.isNaN(toTime) && rawTime > toTime + 24 * 60 * 60 * 1000 - 1) return false
+      }
+    }
+    return true
+  }
+
+  // Frontend filtering: search term + header column filters (backend still handles the top filter bar)
+  const filteredContracts = useMemo(() => {
+    const q = searchTerm.trim().toLowerCase()
+    return contracts.filter(contract => {
+      const matchesSearch =
+        q === '' ||
+        contract.contract_id?.toLowerCase().includes(q) ||
+        contract.po_number?.toLowerCase().includes(q) ||
+        contract.po_numbers?.toLowerCase().includes(q) ||
+        contract.sto_number?.toLowerCase().includes(q) ||
+        contract.sto_numbers?.toLowerCase().includes(q) ||
+        contract.supplier?.toLowerCase().includes(q) ||
+        contract.product?.toLowerCase().includes(q) ||
+        contract.transport_mode?.toLowerCase().includes(q)
+
+      if (!matchesSearch) return false
+      return passesColumnFilters(contract)
+    })
+  }, [contracts, searchTerm, columnFilters])
 
   type CompactColumn = {
     id: string
@@ -682,6 +798,42 @@ export default function ContractsPage() {
     })
     return copy
   }, [compactColumns, filteredContracts, sortDir, sortKey])
+
+  const isColumnFilterActive = (colId: string) => {
+    const f = columnFilters[colId]
+    if (!f) return false
+    if (f.emptyOnly) return true
+    if (f.type === 'text') return Boolean(f.value && f.value.trim() !== '')
+    if (f.type === 'number') return Boolean((f.min && f.min !== '') || (f.max && f.max !== ''))
+    if (f.type === 'date') return Boolean((f.from && f.from !== '') || (f.to && f.to !== ''))
+    return false
+  }
+
+  const clearColumnFilter = (colId: string) => {
+    setColumnFilters(prev => {
+      const next = { ...prev }
+      delete next[colId]
+      return next
+    })
+  }
+
+  const setOrClearFilter = (colId: string, next: ColumnFilter) => {
+    const active =
+      next.emptyOnly ||
+      (next.type === 'text' && Boolean(next.value?.trim())) ||
+      (next.type === 'number' && Boolean((next.min && next.min !== '') || (next.max && next.max !== ''))) ||
+      (next.type === 'date' && Boolean((next.from && next.from !== '') || (next.to && next.to !== '')))
+
+    setColumnFilters(prev => {
+      const copy = { ...prev }
+      if (!active) {
+        delete copy[colId]
+      } else {
+        copy[colId] = next
+      }
+      return copy
+    })
+  }
 
   // Update desktop table scroll width (for top scrollbar)
   useEffect(() => {
@@ -1001,20 +1153,202 @@ export default function ContractsPage() {
                       >
                         <div />
                         {visibleColumns.map(col => {
-                          const active = sortKey === col.id
+                          const activeSort = sortKey === col.id
+                          const filterActive = isColumnFilterActive(col.id)
+                          const filterType = getFilterTypeForColumn(col.id)
+                          const current = columnFilters[col.id]
+
                           return (
-                            <button
-                              key={col.id}
-                              type="button"
-                              className={`flex items-center gap-1 text-left ${col.sortable ? 'hover:text-gray-900' : ''}`}
-                              onClick={() => onSortHeaderClick(col)}
-                              title={col.sortable ? 'Sort' : undefined}
-                            >
-                              <span className="truncate">{col.label}</span>
-                              {col.sortable && active && (
-                                sortDir === 'asc' ? <ArrowUp className="h-3 w-3" /> : <ArrowDown className="h-3 w-3" />
+                            <div key={col.id} className="relative min-w-0">
+                              <div className="flex items-center gap-1 min-w-0">
+                                <button
+                                  type="button"
+                                  className={`flex items-center gap-1 text-left min-w-0 ${col.sortable ? 'hover:text-gray-900' : ''}`}
+                                  onClick={() => onSortHeaderClick(col)}
+                                  title={col.sortable ? 'Sort' : undefined}
+                                >
+                                  <span className="truncate">{col.label}</span>
+                                  {col.sortable && activeSort && (
+                                    sortDir === 'asc' ? <ArrowUp className="h-3 w-3" /> : <ArrowDown className="h-3 w-3" />
+                                  )}
+                                </button>
+
+                                <button
+                                  type="button"
+                                  className={`p-1 rounded hover:bg-gray-100 ${filterActive ? 'text-blue-700' : 'text-gray-500'}`}
+                                  title="Filter"
+                                  onClick={(e) => {
+                                    e.stopPropagation()
+                                    setOpenHeaderFilterId(prev => (prev === col.id ? null : col.id))
+                                  }}
+                                >
+                                  <Filter className="h-3.5 w-3.5" />
+                                </button>
+                              </div>
+
+                              {openHeaderFilterId === col.id && (
+                                <div
+                                  ref={headerFilterPopoverRef}
+                                  className="absolute left-0 top-full mt-2 w-[280px] bg-white border border-gray-200 rounded-lg shadow-lg p-3 z-30"
+                                  onClick={(e) => e.stopPropagation()}
+                                >
+                                  <div className="flex items-center justify-between mb-2">
+                                    <div className="text-xs font-semibold text-gray-700 truncate">{col.label} Filter</div>
+                                    <button
+                                      type="button"
+                                      className="text-xs text-gray-500 hover:text-gray-800"
+                                      onClick={() => setOpenHeaderFilterId(null)}
+                                    >
+                                      Close
+                                    </button>
+                                  </div>
+
+                                  {/* Text filter */}
+                                  {filterType === 'text' && (
+                                    <div className="space-y-2">
+                                      <Input
+                                        value={(current?.type === 'text' && current.value) ? current.value : ''}
+                                        onChange={(e) => {
+                                          const value = e.target.value
+                                          setOrClearFilter(col.id, {
+                                            type: 'text',
+                                            value,
+                                            exact: current?.type === 'text' ? Boolean(current.exact) : false,
+                                            emptyOnly: current?.type === 'text' ? Boolean(current.emptyOnly) : false,
+                                          })
+                                        }}
+                                        placeholder="Type to filter (contains)"
+                                        className="h-8 text-sm"
+                                      />
+                                      <div className="flex items-center justify-between gap-3">
+                                        <label className="flex items-center gap-2 text-xs text-gray-700">
+                                          <Checkbox
+                                            checked={current?.type === 'text' ? Boolean(current.exact) : false}
+                                            onCheckedChange={(checked) => {
+                                              const value = current?.type === 'text' ? current.value : ''
+                                              setOrClearFilter(col.id, {
+                                                type: 'text',
+                                                value,
+                                                exact: Boolean(checked),
+                                                emptyOnly: current?.type === 'text' ? Boolean(current.emptyOnly) : false,
+                                              })
+                                            }}
+                                          />
+                                          Exact match
+                                        </label>
+                                        <label className="flex items-center gap-2 text-xs text-gray-700">
+                                          <Checkbox
+                                            checked={Boolean(current?.emptyOnly)}
+                                            onCheckedChange={(checked) => {
+                                              const value = current?.type === 'text' ? current.value : ''
+                                              setOrClearFilter(col.id, {
+                                                type: 'text',
+                                                value,
+                                                exact: current?.type === 'text' ? Boolean(current.exact) : false,
+                                                emptyOnly: Boolean(checked),
+                                              })
+                                            }}
+                                          />
+                                          Only blanks
+                                        </label>
+                                      </div>
+                                    </div>
+                                  )}
+
+                                  {/* Number filter */}
+                                  {filterType === 'number' && (
+                                    <div className="space-y-2">
+                                      <div className="grid grid-cols-2 gap-2">
+                                        <Input
+                                          value={(current?.type === 'number' && current.min) ? current.min : ''}
+                                          onChange={(e) => {
+                                            const min = e.target.value
+                                            const max = current?.type === 'number' ? current.max : ''
+                                            setOrClearFilter(col.id, { type: 'number', min, max, emptyOnly: Boolean(current?.emptyOnly) })
+                                          }}
+                                          placeholder="Min"
+                                          className="h-8 text-sm"
+                                        />
+                                        <Input
+                                          value={(current?.type === 'number' && current.max) ? current.max : ''}
+                                          onChange={(e) => {
+                                            const max = e.target.value
+                                            const min = current?.type === 'number' ? current.min : ''
+                                            setOrClearFilter(col.id, { type: 'number', min, max, emptyOnly: Boolean(current?.emptyOnly) })
+                                          }}
+                                          placeholder="Max"
+                                          className="h-8 text-sm"
+                                        />
+                                      </div>
+                                      <label className="flex items-center gap-2 text-xs text-gray-700">
+                                        <Checkbox
+                                          checked={Boolean(current?.emptyOnly)}
+                                          onCheckedChange={(checked) => {
+                                            const min = current?.type === 'number' ? current.min : ''
+                                            const max = current?.type === 'number' ? current.max : ''
+                                            setOrClearFilter(col.id, { type: 'number', min, max, emptyOnly: Boolean(checked) })
+                                          }}
+                                        />
+                                        Only blanks
+                                      </label>
+                                    </div>
+                                  )}
+
+                                  {/* Date filter */}
+                                  {filterType === 'date' && (
+                                    <div className="space-y-2">
+                                      <div className="grid grid-cols-2 gap-2">
+                                        <Input
+                                          type="date"
+                                          value={(current?.type === 'date' && current.from) ? current.from : ''}
+                                          onChange={(e) => {
+                                            const from = e.target.value
+                                            const to = current?.type === 'date' ? current.to : ''
+                                            setOrClearFilter(col.id, { type: 'date', from, to, emptyOnly: Boolean(current?.emptyOnly) })
+                                          }}
+                                          className="h-8 text-sm"
+                                        />
+                                        <Input
+                                          type="date"
+                                          value={(current?.type === 'date' && current.to) ? current.to : ''}
+                                          onChange={(e) => {
+                                            const to = e.target.value
+                                            const from = current?.type === 'date' ? current.from : ''
+                                            setOrClearFilter(col.id, { type: 'date', from, to, emptyOnly: Boolean(current?.emptyOnly) })
+                                          }}
+                                          className="h-8 text-sm"
+                                        />
+                                      </div>
+                                      <label className="flex items-center gap-2 text-xs text-gray-700">
+                                        <Checkbox
+                                          checked={Boolean(current?.emptyOnly)}
+                                          onCheckedChange={(checked) => {
+                                            const from = current?.type === 'date' ? current.from : ''
+                                            const to = current?.type === 'date' ? current.to : ''
+                                            setOrClearFilter(col.id, { type: 'date', from, to, emptyOnly: Boolean(checked) })
+                                          }}
+                                        />
+                                        Only blanks
+                                      </label>
+                                    </div>
+                                  )}
+
+                                  <div className="flex items-center justify-between mt-3 pt-2 border-t">
+                                    <button
+                                      type="button"
+                                      className="text-xs text-gray-600 hover:text-gray-900"
+                                      onClick={() => clearColumnFilter(col.id)}
+                                      disabled={!filterActive}
+                                    >
+                                      Clear
+                                    </button>
+                                    <div className="text-[11px] text-gray-500">
+                                      {filterActive ? 'Filtered' : 'No filter'}
+                                    </div>
+                                  </div>
+                                </div>
                               )}
-                            </button>
+                            </div>
                           )
                         })}
                         <div className="text-right sticky right-0 bg-gray-50 border-l pl-3 pr-2">Actions</div>

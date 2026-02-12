@@ -6,6 +6,8 @@ import logger from '../utils/logger';
 export const getContracts = async (req: AuthRequest, res: Response) => {
   try {
     const { status, supplier, buyer, dateFrom, dateTo, outstanding, companyCode, b2bFlag, page = 1, limit = 10 } = req.query;
+    // Allow filtering by a specific contract id (used by shipment details fallback)
+    const contractIdFilter = (req.query as any).contract_id || (req.query as any).contractId || null;
     const offset = (Number(page) - 1) * Number(limit);
 
     // Updated query to group contracts by contract_id
@@ -183,6 +185,12 @@ export const getContracts = async (req: AuthRequest, res: Response) => {
     const queryParams: any[] = [];
     let paramIndex = 1;
 
+    if (contractIdFilter) {
+      queryText += ` AND c.contract_id = $${paramIndex}`;
+      queryParams.push(contractIdFilter);
+      paramIndex++;
+    }
+    
     if (status) {
       // Handle both ACTIVE/CLOSE and Open/Close
       // Priority: Use SAP import status if available, otherwise use contracts table status
@@ -335,6 +343,12 @@ export const getContracts = async (req: AuthRequest, res: Response) => {
           WHERE 1=1
       `;
       let countParamIndex = 1;
+
+      if (contractIdFilter) {
+        countQuery += ` AND c.contract_id = $${countParamIndex}`;
+        countParams.push(contractIdFilter);
+        countParamIndex++;
+      }
       
       if (status) {
         if (status === 'Open' || status === 'ACTIVE') {
@@ -457,6 +471,12 @@ export const getContracts = async (req: AuthRequest, res: Response) => {
     } else {
       countQuery = 'SELECT COUNT(DISTINCT c.contract_id) as count FROM contracts c WHERE 1=1';
       let countParamIndex = 1;
+
+      if (contractIdFilter) {
+        countQuery += ` AND c.contract_id = $${countParamIndex}`;
+        countParams.push(contractIdFilter);
+        countParamIndex++;
+      }
       
       if (status) {
         if (status === 'Open' || status === 'ACTIVE') {

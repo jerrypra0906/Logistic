@@ -401,8 +401,16 @@ export class SapDataDistributionService {
     const loadingMethod = shipmentData.loading_method || null;
     const dischargeMethod = shipmentData.discharge_method || null;
 
-    const portOfLoading = shipmentData.vessel_loading_port_1 || shipmentData.port_of_loading || shipmentData.loading_port || shipmentData.loading_port_1 || null;
-    const portOfDischarge = shipmentData.vessel_discharge_port || shipmentData.port_of_discharge || shipmentData.discharge_port || null;
+    // Prioritize vessel_loading_port_1 from SAP data, ensuring we don't use invalid values like '0.00'
+    let portOfLoading = shipmentData.vessel_loading_port_1 || shipmentData.port_of_loading || shipmentData.loading_port || shipmentData.loading_port_1 || null;
+    if (portOfLoading && (portOfLoading === '0.00' || portOfLoading.trim() === '')) {
+      portOfLoading = null;
+    }
+    
+    let portOfDischarge = shipmentData.vessel_discharge_port || shipmentData.port_of_discharge || shipmentData.discharge_port || null;
+    if (portOfDischarge && (portOfDischarge === '0.00' || portOfDischarge.trim() === '')) {
+      portOfDischarge = null;
+    }
 
     const etaArrival = this.parseDate(shipmentData.eta_vessel_arrival_loading_port_1 || shipmentData.eta_arrival_loading_port_1);
     const ataArrival = this.parseDate(shipmentData.ata_vessel_arrival_at_loading_port_1);
@@ -466,8 +474,8 @@ export class SapDataDistributionService {
           charter_type = COALESCE($12, charter_type),
           loading_method = COALESCE($13, loading_method),
           discharge_method = COALESCE($14, discharge_method),
-          port_of_loading = COALESCE($15, port_of_loading),
-          port_of_discharge = COALESCE($16, port_of_discharge),
+          port_of_loading = CASE WHEN $15 IS NOT NULL AND $15 != '' AND $15 != '0.00' THEN $15 ELSE port_of_loading END,
+          port_of_discharge = CASE WHEN $16 IS NOT NULL AND $16 != '' AND $16 != '0.00' THEN $16 ELSE port_of_discharge END,
           eta_arrival = COALESCE($17::date, eta_arrival),
           ata_arrival = COALESCE($18::date, ata_arrival),
           eta_sailed = COALESCE($19::date, eta_sailed),
@@ -937,6 +945,17 @@ export class SapDataDistributionService {
     const data = truckingData.data;
     if (!data || Object.keys(data).length === 0) return null;
     
+    // Filter out invalid values like '0.00' for string fields
+    let loadingLocation = data.truck_loading_at_starting_location;
+    if (loadingLocation && (loadingLocation === '0.00' || loadingLocation.trim() === '')) {
+      loadingLocation = null;
+    }
+    
+    let unloadingLocation = data.truck_unloading_at_starting_location;
+    if (unloadingLocation && (unloadingLocation === '0.00' || unloadingLocation.trim() === '')) {
+      unloadingLocation = null;
+    }
+    
     const result = await client.query(
       `INSERT INTO trucking_operations (
         shipment_id, contract_id, location_sequence, cargo_readiness_date,
@@ -953,8 +972,8 @@ export class SapDataDistributionService {
         contractId,
         truckingData.sequence,
         this.parseDate(data.cargo_readiness_at_starting_location),
-        data.truck_loading_at_starting_location,
-        data.truck_unloading_at_starting_location,
+        loadingLocation,
+        unloadingLocation,
         data.trucking_owner_at_starting_location,
         this.parseNumber(data.trucking_oa_budget_at_starting_location),
         this.parseNumber(data.trucking_oa_actual_at_starting_location),

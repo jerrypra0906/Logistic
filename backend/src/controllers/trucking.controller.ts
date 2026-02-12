@@ -14,12 +14,14 @@ export const getTruckingOperations = async (req: AuthRequest, res: Response) => 
         t.operation_id,
         t.contract_id,
         t.location,
+        t.loading_location,
+        t.unloading_location,
         t.trucking_owner,
         t.cargo_readiness_date,
-        t.truck_loading_date,
-        t.truck_unloading_date,
         t.trucking_start_date,
         t.trucking_completion_date,
+        t.eta_trucking_start_date,
+        t.eta_trucking_completion_date,
         t.quantity_sent,
         t.quantity_delivered,
         t.gain_loss_percentage,
@@ -30,13 +32,20 @@ export const getTruckingOperations = async (req: AuthRequest, res: Response) => 
         t.created_at,
         t.updated_at,
         c.contract_id as contract_number,
+        c.po_number,
         c.sto_number,
+        c.quantity_ordered as sto_quantity,
+        c.quantity_ordered as contract_qty,
+        c.delivery_start_date,
+        c.delivery_end_date,
         c.supplier,
         c.buyer,
         c.product,
-        c.group_name
+        c.group_name,
+        s.estimated_km
       FROM trucking_operations t
       LEFT JOIN contracts c ON t.contract_id = c.id
+      LEFT JOIN shipments s ON t.shipment_id = s.id
       WHERE 1=1
     `;
     const queryParams: any[] = [];
@@ -87,6 +96,7 @@ export const getTruckingOperations = async (req: AuthRequest, res: Response) => 
       SELECT COUNT(*) as count
       FROM trucking_operations t
       LEFT JOIN contracts c ON t.contract_id = c.id
+      LEFT JOIN shipments s ON t.shipment_id = s.id
       WHERE 1=1
     `;
     const countParams: any[] = [];
@@ -191,6 +201,149 @@ export const getTruckingOperationById = async (req: AuthRequest, res: Response) 
   }
 };
 
+export const createTruckingOperation = async (req: AuthRequest, res: Response) => {
+  try {
+    const {
+      contract_number,
+      operation_id,
+      location,
+      loading_location,
+      unloading_location,
+      trucking_owner,
+      cargo_readiness_date,
+      trucking_start_date,
+      trucking_completion_date,
+      eta_trucking_start_date,
+      eta_trucking_completion_date,
+      quantity_sent,
+      quantity_delivered,
+      gain_loss_percentage,
+      gain_loss_amount,
+      oa_budget,
+      oa_actual,
+      status
+    } = req.body;
+
+    // Validate required fields
+    if (!contract_number) {
+      return res.status(400).json({
+        success: false,
+        error: { message: 'Contract number is required' },
+      });
+    }
+
+    // Check if contract exists
+    const contractResult = await query(
+      `SELECT id FROM contracts WHERE contract_id = $1 LIMIT 1`,
+      [contract_number]
+    );
+
+    if (contractResult.rows.length === 0) {
+      return res.status(400).json({
+        success: false,
+        error: { message: 'Contract number does not exist' },
+      });
+    }
+
+    const contractId = contractResult.rows[0].id;
+
+    // Generate operation_id if not provided
+    const finalOperationId = operation_id || `TRUCK-${Date.now()}`;
+
+    // Insert new trucking operation
+    const result = await query(
+      `INSERT INTO trucking_operations (
+        contract_id, operation_id, location, loading_location, unloading_location,
+        trucking_owner, cargo_readiness_date,
+        trucking_start_date, trucking_completion_date,
+        eta_trucking_start_date, eta_trucking_completion_date,
+        quantity_sent, quantity_delivered,
+        gain_loss_percentage, gain_loss_amount, oa_budget, oa_actual, status
+      ) VALUES (
+        $1::uuid, $2, $3, $4, $5, $6, $7::date,
+        $8::date, $9::date,
+        $10::date, $11::date,
+        $12::numeric, $13::numeric, $14::numeric,
+        $15::numeric, $16::numeric, $17
+      ) RETURNING *`,
+      [
+        contractId,
+        finalOperationId,
+        location || null,
+        loading_location || null,
+        unloading_location || null,
+        trucking_owner || null,
+        cargo_readiness_date || null,
+        trucking_start_date || null,
+        trucking_completion_date || null,
+        eta_trucking_start_date || null,
+        eta_trucking_completion_date || null,
+        quantity_sent || null,
+        quantity_delivered || null,
+        gain_loss_percentage || null,
+        gain_loss_amount || null,
+        oa_budget || null,
+        oa_actual || null,
+        status || 'PLANNED'
+      ]
+    );
+
+    logger.info('Trucking operation created:', { id: result.rows[0].id, operation_id: finalOperationId });
+
+    return res.json({
+      success: true,
+      data: result.rows[0],
+      message: 'Trucking operation created successfully',
+    });
+  } catch (error) {
+    logger.error('Create trucking operation error:', error);
+    return res.status(500).json({
+      success: false,
+      error: { message: 'Failed to create trucking operation' },
+    });
+  }
+};
+
+export const validateContractNumber = async (req: AuthRequest, res: Response) => {
+  try {
+    const { contract_number } = req.query;
+
+    if (!contract_number) {
+      return res.status(400).json({
+        success: false,
+        error: { message: 'Contract number is required' },
+      });
+    }
+
+    const result = await query(
+      `SELECT id, contract_id, sto_number, supplier, product, group_name, quantity_ordered 
+       FROM contracts 
+       WHERE contract_id = $1 LIMIT 1`,
+      [contract_number]
+    );
+
+    if (result.rows.length === 0) {
+      return res.json({
+        success: true,
+        exists: false,
+        message: 'Contract number does not exist',
+      });
+    }
+
+    return res.json({
+      success: true,
+      exists: true,
+      data: result.rows[0],
+    });
+  } catch (error) {
+    logger.error('Validate contract number error:', error);
+    return res.status(500).json({
+      success: false,
+      error: { message: 'Failed to validate contract number' },
+    });
+  }
+};
+
 export const updateTruckingOperation = async (req: AuthRequest, res: Response) => {
   try {
     const { id } = req.params;
@@ -211,17 +364,31 @@ export const updateTruckingOperation = async (req: AuthRequest, res: Response) =
 
     // List of allowed fields that can be updated
     const allowedFields = [
-      'operation_id', 'location', 'trucking_owner', 'cargo_readiness_date',
-      'truck_loading_date', 'truck_unloading_date', 'trucking_start_date',
-      'trucking_completion_date', 'quantity_sent', 'quantity_delivered',
-      'gain_loss_percentage', 'gain_loss_amount', 'oa_budget', 'oa_actual',
-      'status'
+      'operation_id', 'location', 'loading_location', 'unloading_location',
+      'trucking_owner', 'cargo_readiness_date',
+      'trucking_start_date', 'trucking_completion_date',
+      'eta_trucking_start_date', 'eta_trucking_completion_date',
+      'quantity_sent', 'quantity_delivered', 'gain_loss_percentage',
+      'gain_loss_amount', 'oa_budget', 'oa_actual', 'status'
+    ];
+
+    // Date fields that need casting
+    const dateFields = [
+      'cargo_readiness_date',
+      'trucking_start_date', 'trucking_completion_date',
+      'eta_trucking_start_date', 'eta_trucking_completion_date'
     ];
 
     for (const [key, value] of Object.entries(updateData)) {
       if (allowedFields.includes(key)) {
-        updateFields.push(`${key} = $${paramIndex}`);
-        updateValues.push(value);
+        if (dateFields.includes(key) && value) {
+          // Cast date fields explicitly
+          updateFields.push(`${key} = $${paramIndex}::date`);
+        } else {
+          updateFields.push(`${key} = $${paramIndex}`);
+        }
+        // Convert empty strings to null for date fields
+        updateValues.push(dateFields.includes(key) && value === '' ? null : value);
         paramIndex++;
       }
     }
